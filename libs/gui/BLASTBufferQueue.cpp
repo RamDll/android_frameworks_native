@@ -1464,11 +1464,30 @@ status_t BufferReleaseReader::readBlocking(ReleaseCallbackId& outId, sp<Fence>& 
         timespec = timespecFromNanos(timeout);
     }
 
+    // epoll_pwait2() only exists since Linux 5.11. On older kernels it fails with ENOSYS, which
+    // would make waitForBufferRelease() return immediately and dequeueBuffer() spin in a busy
+    // loop. Fall back to epoll_wait() with the timeout rounded up to whole milliseconds.
+    static std::atomic<bool> sHasEpollPwait2{true};
+
     epoll_event event{};
     int eventCount;
     do {
-        eventCount = epoll_pwait2(mEpollFd.get(), &event, 1 /*maxevents*/,
-                                  timespec ? &(*timespec) : nullptr, nullptr /*sigmask*/);
+        if (sHasEpollPwait2.load(std::memory_order_relaxed)) {
+            eventCount = epoll_pwait2(mEpollFd.get(), &event, 1 /*maxevents*/,
+                                      timespec ? &(*timespec) : nullptr, nullptr /*sigmask*/);
+            if (eventCount == -1 && errno == ENOSYS) {
+                sHasEpollPwait2.store(false, std::memory_order_relaxed);
+                errno = EINTR; // retry below with epoll_wait()
+                continue;
+            }
+        } else {
+            int timeoutMs = -1;
+            if (timeout >= 0) {
+                const nsecs_t ms = (timeout + 999999) / 1000000;
+                timeoutMs = ms > INT32_MAX ? INT32_MAX : static_cast<int>(ms);
+            }
+            eventCount = epoll_wait(mEpollFd.get(), &event, 1 /*maxevents*/, timeoutMs);
+        }
     } while (eventCount == -1 && errno == EINTR);
 
     if (eventCount == -1) {
