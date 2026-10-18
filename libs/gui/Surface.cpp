@@ -27,7 +27,14 @@
 #include <mutex>
 #include <thread>
 
+#include <fcntl.h>
 #include <inttypes.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <unistd.h>
+
+#include <unordered_map>
 
 #ifndef NO_BINDER
 #include <android/gui/DisplayStatInfo.h>
@@ -42,6 +49,7 @@
 
 #include <android/native_window.h>
 
+#include <android-base/properties.h>
 #include <android-base/strings.h>
 #include <gui/FenceMonitor.h>
 #include <gui/TraceUtils.h>
@@ -103,6 +111,141 @@ bool isInterceptorRegistrationOp(int op) {
             op == NATIVE_WINDOW_SET_QUEUE_INTERCEPTOR ||
             op == NATIVE_WINDOW_SET_QUERY_INTERCEPTOR;
 }
+
+// MediaTek GED KPI: tell the MediaTek GPU driver (GED, /proc/ged) when each frame of an
+// EGL/Vulkan surface is dequeued, queued and acquired, so that its frame-based GPU DVFS
+// works. MediaTek's own libgui does this through libged_kpi.so; without it the GPU stays
+// at low OPPs during UI animations. Same ioctl as TrebleDroid's "Add MTK GED KPI support
+// to fix broken Mediatek gpufreq" (platform_frameworks_native 68efe2a8cc).
+// Enabled with debug.lib_gui.mtk_ged_kpi=1; a no-op when /proc/ged is missing or GED KPI is off.
+class MtkGedKpi {
+public:
+    static MtkGedKpi& get() {
+        static MtkGedKpi* instance = new MtkGedKpi();
+        return *instance;
+    }
+
+    void onConnect(const void* surface, int api, uint64_t bqId) {
+        if (mFd < 0 || api != NATIVE_WINDOW_API_EGL) return;
+        std::scoped_lock lock(mMutex);
+        mSurfaces[surface] = bqId;
+    }
+
+    void onDisconnect(const void* surface) {
+        if (mFd < 0) return;
+        std::scoped_lock lock(mMutex);
+        mSurfaces.erase(surface);
+    }
+
+    void onDequeue(const void* surface, const native_handle_t* handle, const sp<Fence>& fence) {
+        timestamp(surface, handle, fence, kDequeue);
+    }
+
+    void onQueue(const void* surface, const native_handle_t* handle, const sp<Fence>& fence,
+                 uint32_t numPendingBuffers) {
+        timestamp(surface, handle, fence, static_cast<int32_t>(numPendingBuffers));
+        timestamp(surface, handle, fence, kAcquire);
+    }
+
+private:
+    // QedBuffer_length values the kernel reads as dequeue / acquire events
+    static constexpr int32_t kDequeue = -2;
+    static constexpr int32_t kAcquire = -1;
+    static constexpr unsigned int kGedBridgeCommandGpuTimestamp = 103;
+
+    struct BridgePackage {
+        unsigned int functionId;
+        int size;
+        void* paramIn;
+        int inBufferSize;
+        void* paramOut;
+        int outBufferSize;
+    };
+    struct GpuTimestampIn {
+        int pid;
+        uint64_t wnd;
+        int32_t frameId;
+        int fenceFd;
+        int qedBufferLength;
+        int isSf;
+    };
+    struct GpuTimestampOut {
+        int error;
+        int gedKpiEnabled;
+    };
+    static constexpr unsigned long kIoGpuTimestamp =
+            _IOWR('g', kGedBridgeCommandGpuTimestamp, BridgePackage);
+
+    MtkGedKpi() {
+        if (!base::GetBoolProperty("debug.lib_gui.mtk_ged_kpi", false)) return;
+        int fd = open("/proc/ged", O_RDONLY | O_CLOEXEC);
+        if (fd < 0) {
+            ALOGW("MTK GED KPI: cannot open /proc/ged: %s", strerror(errno));
+            return;
+        }
+        // Probe with an acquire event for an unknown window: the reply says whether GED KPI is on.
+        GpuTimestampIn in = {
+                .pid = getpid(),
+                .wnd = 0,
+                .frameId = 0,
+                .fenceFd = -1,
+                .qedBufferLength = kAcquire,
+                .isSf = 0,
+        };
+        GpuTimestampOut out = {};
+        if (doIoctl(fd, in, out) != 0 || out.gedKpiEnabled != 1) {
+            ALOGW("MTK GED KPI: not available (errno %d, enabled %d)", errno, out.gedKpiEnabled);
+            close(fd);
+            return;
+        }
+        mPid = getpid();
+        const char* name = getprogname();
+        mIsSf = name != nullptr && strcmp(name, "surfaceflinger") == 0;
+        mFd = fd;
+    }
+
+    static int doIoctl(int fd, GpuTimestampIn& in, GpuTimestampOut& out) {
+        BridgePackage package = {
+                .functionId = static_cast<unsigned int>(kIoGpuTimestamp),
+                .size = sizeof(BridgePackage),
+                .paramIn = &in,
+                .inBufferSize = sizeof(in),
+                .paramOut = &out,
+                .outBufferSize = sizeof(out),
+        };
+        return ioctl(fd, kIoGpuTimestamp, &package);
+    }
+
+    void timestamp(const void* surface, const native_handle_t* handle, const sp<Fence>& fence,
+                   int32_t qedBufferLength) {
+        if (mFd < 0 || handle == nullptr) return;
+        uint64_t bqId;
+        {
+            std::scoped_lock lock(mMutex);
+            auto it = mSurfaces.find(surface);
+            if (it == mSurfaces.end()) return;
+            bqId = it->second;
+        }
+        const int fenceFd = (fence != nullptr && fence->isValid()) ? fence->dup() : -1;
+        GpuTimestampIn in = {
+                .pid = mPid,
+                .wnd = bqId,
+                .frameId = static_cast<int32_t>(reinterpret_cast<intptr_t>(handle) & 0x3fffffff),
+                .fenceFd = fenceFd,
+                .qedBufferLength = qedBufferLength,
+                .isSf = mIsSf ? 1 : 0,
+        };
+        GpuTimestampOut out = {};
+        doIoctl(mFd, in, out);
+        if (fenceFd >= 0) close(fenceFd);
+    }
+
+    int mFd = -1;
+    int mPid = -1;
+    bool mIsSf = false;
+    std::mutex mMutex;
+    std::unordered_map<const void*, uint64_t> mSurfaces;
+};
 
 } // namespace
 
@@ -197,6 +340,7 @@ Surface::~Surface() {
     if (mConnectedToCpu) {
         Surface::disconnect(NATIVE_WINDOW_API_CPU);
     }
+    MtkGedKpi::get().onDisconnect(this);
 #if !defined(NO_BINDER)
     if (mSurfaceDeathListener != nullptr) {
         IInterface::asBinder(mGraphicBufferProducer)->unlinkToDeath(mSurfaceDeathListener);
@@ -836,6 +980,8 @@ int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
         }
     }
 
+    MtkGedKpi::get().onDequeue(this, gbuf->handle, fence);
+
     if (fence->isValid()) {
         *fenceFd = fence->dup();
         if (*fenceFd == -1) {
@@ -1428,6 +1574,10 @@ void Surface::applyGrallocMetadataLocked(
 void Surface::onBufferQueuedLocked(int slot, const sp<Fence>& fence,
                                    const IGraphicBufferProducer::QueueBufferOutput& output) {
     mDequeuedSlots.erase(slot);
+    if (mSlots[slot].buffer != nullptr) {
+        MtkGedKpi::get().onQueue(this, mSlots[slot].buffer->handle, fence,
+                                 output.numPendingBuffers);
+    }
     if (mSlots[slot].requiresFreeOnReturn) {
         mSlots[slot].buffer = nullptr;
         mSlots[slot].requiresFreeOnReturn = false;
@@ -2378,6 +2528,7 @@ int Surface::connect(int api, const sp<SurfaceListener>& listener, bool reportBu
             std::scoped_lock _dl(mDebugMutex);
             mDebugName = mGraphicBufferProducer->getConsumerName();
             mGraphicBufferProducer->getUniqueId(&mId);
+            MtkGedKpi::get().onConnect(this, api, mId);
         }
         SURF_LOGE_IF(idErr != NO_ERROR, "Unable to get ID from IGBP: %d", idErr);
         mIsConnected = true;
@@ -2409,6 +2560,8 @@ int Surface::disconnect(int api, IGraphicBufferProducer::DisconnectMode mode) {
     SURF_LOGE_IF(err != NO_ERROR,
                  "Surface failed to disconnect. Cleaning up internals anyway. Error %d (%s).", err,
                  statusToString(err).c_str());
+
+    MtkGedKpi::get().onDisconnect(this);
 
     Mutex::Autolock lock(mMutex);
     mRemovedBuffers.clear();
