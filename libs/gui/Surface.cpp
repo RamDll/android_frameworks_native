@@ -20,7 +20,6 @@
 
 #include <gui/Surface.h>
 
-#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -248,120 +247,6 @@ private:
     std::unordered_map<const void*, uint64_t> mSurfaces;
 };
 
-// MediaTek FPSGO: tell MediaTek's frame-aware CPU DVFS (FPSGO, /proc/perfmgr/perf_ioctl) when
-// the producer thread of an EGL/Vulkan surface starts and ends each dequeue and queue, so that
-// it finds the render thread and scales the CPU per frame. MediaTek's own libgui does this
-// through libperfctl.so (xgfNotifyBqid/Connect/Dequeue/Queue); the events and their order here
-// follow the stock HyperOS libgui of emerald, except that only EGL surfaces are reported, BQID is
-// sent at connect (stock: in the Surface constructor) and removed at disconnect, and ACQUIRE
-// is not sent. Without them FPSGO never tracks a frame.
-// Enabled with debug.lib_gui.mtk_fpsgo=1; a no-op when the node is missing.
-class MtkFpsgo {
-public:
-    static MtkFpsgo& get() {
-        static MtkFpsgo* instance = new MtkFpsgo();
-        return *instance;
-    }
-
-    bool enabled() const { return mEnabled.load(std::memory_order_relaxed); }
-
-    void onConnect(const void* surface, int api, uint64_t bqId, bool consumerIsSf) {
-        if (!enabled() || api != NATIVE_WINDOW_API_EGL) return;
-        {
-            std::scoped_lock lock(mMutex);
-            if (!mSurfaces.emplace(surface, bqId).second) return;
-        }
-        notify(kBqid, {.value1 = 1, .bufId = bqId, .queueSf = consumerIsSf ? 1 : 0}, surface);
-        notify(kConnect, {.value1 = static_cast<uint32_t>(api)}, surface);
-    }
-
-    void onDisconnect(const void* surface) {
-        if (!enabled()) return;
-        uint64_t bqId;
-        {
-            std::scoped_lock lock(mMutex);
-            auto it = mSurfaces.find(surface);
-            if (it == mSurfaces.end()) return;
-            bqId = it->second;
-            mSurfaces.erase(it);
-        }
-        notify(kConnect, {.value1 = 0}, surface);
-        notify(kBqid, {.value1 = 0, .bufId = bqId}, surface);
-    }
-
-    // Sends the start of a dequeue or queue now and its end when it goes out of scope.
-    class Scope {
-    public:
-        Scope(const void* surface, bool queue, uint64_t bufferId = 0)
-              : mSurface(MtkFpsgo::get().isTracked(surface) ? surface : nullptr),
-                mCommand(queue ? kQueue : kDequeue),
-                mBufferId(bufferId) {
-            if (mSurface != nullptr) MtkFpsgo::get().notify(mCommand, {.value1 = 1}, mSurface);
-        }
-        ~Scope() {
-            if (mSurface != nullptr) {
-                MtkFpsgo::get().notify(mCommand, {.value1 = 0, .bufId = mBufferId}, mSurface);
-            }
-        }
-
-    private:
-        const void* const mSurface;
-        const unsigned long mCommand;
-        const uint64_t mBufferId;
-    };
-
-private:
-    // struct _FPSGO_PACKAGE of MediaTek's perf_ioctl driver (40 bytes)
-    struct Package {
-        uint32_t tid;
-        uint32_t value1; // start / connected API / create
-        uint64_t bufId;
-        uint64_t frameId;
-        int32_t queueSf;
-        uint64_t identifier;
-    };
-    static_assert(sizeof(Package) == 40);
-    static constexpr unsigned long kQueue = _IOW('g', 1, Package);
-    static constexpr unsigned long kDequeue = _IOW('g', 3, Package);
-    static constexpr unsigned long kConnect = _IOW('g', 15, Package);
-    static constexpr unsigned long kBqid = _IOW('g', 16, Package);
-
-    MtkFpsgo() {
-        if (!base::GetBoolProperty("debug.lib_gui.mtk_fpsgo", false)) return;
-        int fd = open("/proc/perfmgr/perf_ioctl", O_RDONLY | O_CLOEXEC);
-        if (fd < 0) {
-            ALOGW("MTK FPSGO: cannot open /proc/perfmgr/perf_ioctl: %s", strerror(errno));
-            return;
-        }
-        mFd = fd;
-        mEnabled = true;
-        ALOGI("MTK FPSGO: enabled");
-    }
-
-    bool isTracked(const void* surface) {
-        if (!enabled()) return false;
-        std::scoped_lock lock(mMutex);
-        return mSurfaces.contains(surface);
-    }
-
-    void notify(unsigned long command, Package package, const void* surface) {
-        package.tid = static_cast<uint32_t>(gettid());
-        package.identifier = reinterpret_cast<uintptr_t>(surface);
-        if (ioctl(mFd, command, &package) < 0 &&
-            (errno == EACCES || errno == EPERM || errno == ENOTTY)) {
-            // Denied or unknown command: stop for this process instead of failing every frame.
-            // The fd stays open, another thread may still be using it.
-            ALOGW("MTK FPSGO: ioctl %#lx failed: %s, disabled", command, strerror(errno));
-            mEnabled = false;
-        }
-    }
-
-    int mFd = -1;
-    std::atomic<bool> mEnabled = false;
-    std::mutex mMutex;
-    std::unordered_map<const void*, uint64_t> mSurfaces;
-};
-
 } // namespace
 
 Surface::ProducerDeathListenerProxy::ProducerDeathListenerProxy(
@@ -456,7 +341,6 @@ Surface::~Surface() {
         Surface::disconnect(NATIVE_WINDOW_API_CPU);
     }
     MtkGedKpi::get().onDisconnect(this);
-    MtkFpsgo::get().onDisconnect(this);
 #if !defined(NO_BINDER)
     if (mSurfaceDeathListener != nullptr) {
         IInterface::asBinder(mGraphicBufferProducer)->unlinkToDeath(mSurfaceDeathListener);
@@ -1015,7 +899,6 @@ int Surface::dequeueBuffer(sp<GraphicBuffer>* buffer, int* fenceFd) {
         ATRACE_FORMAT("dequeueBuffer - %s", mDebugName.c_str());
     }
     SURF_LOGV("Surface::dequeueBuffer");
-    MtkFpsgo::Scope fpsgoDequeue(this, /*queue=*/false);
 
     IGraphicBufferProducer::DequeueBufferInput dqInput;
     {
@@ -1596,7 +1479,6 @@ status_t Surface::queueBufferImpl(const sp<GraphicBuffer>& buffer, const sp<Fenc
     if (buffer == nullptr) {
         return BAD_VALUE;
     }
-    MtkFpsgo::Scope fpsgoQueue(this, /*queue=*/true, buffer->getId());
 
     IGraphicBufferProducer::QueueBufferOutput igbpOutput;
     IGraphicBufferProducer::QueueBufferInput igbpInput;
@@ -2642,21 +2524,13 @@ int Surface::connect(int api, const sp<SurfaceListener>& listener, bool reportBu
 #endif // !defined(NO_BINDER)
 
         status_t idErr = NO_ERROR;
-        uint64_t id;
         {
             std::scoped_lock _dl(mDebugMutex);
             mDebugName = mGraphicBufferProducer->getConsumerName();
             mGraphicBufferProducer->getUniqueId(&mId);
             MtkGedKpi::get().onConnect(this, api, mId);
-            id = mId;
         }
         SURF_LOGE_IF(idErr != NO_ERROR, "Unable to get ID from IGBP: %d", idErr);
-        if (MtkFpsgo::get().enabled() && api == NATIVE_WINDOW_API_EGL) {
-            uint64_t consumerUsage = 0;
-            mGraphicBufferProducer->getConsumerUsage(&consumerUsage);
-            MtkFpsgo::get().onConnect(this, api, id,
-                                      (consumerUsage & GraphicBuffer::USAGE_HW_COMPOSER) != 0);
-        }
         mIsConnected = true;
     }
     if (!err && api == NATIVE_WINDOW_API_CPU) {
@@ -2688,7 +2562,6 @@ int Surface::disconnect(int api, IGraphicBufferProducer::DisconnectMode mode) {
                  statusToString(err).c_str());
 
     MtkGedKpi::get().onDisconnect(this);
-    MtkFpsgo::get().onDisconnect(this);
 
     Mutex::Autolock lock(mMutex);
     mRemovedBuffers.clear();
