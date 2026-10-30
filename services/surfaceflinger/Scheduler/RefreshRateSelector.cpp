@@ -1826,7 +1826,9 @@ std::chrono::milliseconds RefreshRateSelector::getIdleTimerTimeout() {
 FpsRange RefreshRateSelector::getFrameRateCategoryRange(FrameRateCategory category) {
     switch (category) {
         case FrameRateCategory::High:
-            return FpsRange{kFrameRateCategoryRateHigh, 120_Hz};
+            // Only the top rate: a {90, 120} range ties both at 1.0 and the ascending
+            // tie-break picks 90, so a 120/90/60 panel steps 120 -> 90 -> 60.
+            return FpsRange{120_Hz, 120_Hz};
         case FrameRateCategory::Normal:
             return FpsRange{kFrameRateCategoryRateNormal, 120_Hz};
         case FrameRateCategory::Low:
